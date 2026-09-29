@@ -1,6 +1,7 @@
 import os
+import sqlite3
 from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify, Response, send_from_directory
-import mysql.connector
+from database import connect as connect_sqlite
 from flask_session import Session
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
@@ -44,12 +45,8 @@ mail = Mail(app)
 # Inicializamos el generador de tokens usando la clave secreta de tu proyecto
 serializer = URLSafeTimedSerializer(app.secret_key)
 
-db_config = {
-    'host': 'localhost',
-    'user': 'tennissel20',
-    'password': 'teniselcora20',
-    'database': 'tennissel20'
-}
+DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'db', 'tennissel20.sqlite3')
+SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'db', 'tennissel2.0.sql')
 
 UPLOAD_FOLDER = os.path.join('static', 'uploads', 'perfiles')
 PRODUCT_UPLOAD_FOLDER = os.path.join('static', 'uploads', 'productos')
@@ -96,23 +93,17 @@ def proxy_imagen():
 
 def get_db_connection():
     try:
-        return mysql.connector.connect(**db_config)
-    except mysql.connector.Error as err:
-        print(f"Error de conexion: {err}")
+        return connect_sqlite(DATABASE_PATH, SCHEMA_PATH)
+    except sqlite3.Error as err:
+        print(f"Error de conexion SQLite: {err}")
         return None
 
 
 def asegurar_columna_hora_fin(conn):
     cursor = conn.cursor()
     try:
-        cursor.execute('''
-            SELECT COUNT(*)
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = 'reservas'
-              AND COLUMN_NAME = 'hora_fin'
-        ''')
-        if not cursor.fetchone()[0]:
+        cursor.execute('PRAGMA table_info(reservas)')
+        if not any(row[1] == 'hora_fin' for row in cursor.fetchall()):
             cursor.execute('ALTER TABLE reservas ADD COLUMN hora_fin TIME DEFAULT NULL')
             conn.commit()
     finally:
@@ -122,25 +113,23 @@ def asegurar_columna_hora_fin(conn):
 def asegurar_columna_usuario_reserva(conn):
     cursor = conn.cursor()
     try:
-        cursor.execute('''
-            SELECT COUNT(*)
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = 'reservas'
-              AND COLUMN_NAME = 'user_id'
-        ''')
-        if not cursor.fetchone()[0]:
-            cursor.execute('ALTER TABLE reservas ADD COLUMN user_id INT NULL AFTER locacion_id')
+        cursor.execute('PRAGMA table_info(reservas)')
+        if not any(row[1] == 'user_id' for row in cursor.fetchall()):
+            cursor.execute('ALTER TABLE reservas ADD COLUMN user_id INT NULL')
             conn.commit()
         cursor.execute('''
-            UPDATE reservas r
-            JOIN usuarios u ON r.user_id IS NULL
-                AND (
-                    CONVERT(r.nombre_usuario USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(u.username USING utf8mb4) COLLATE utf8mb4_general_ci
-                    OR CONVERT(r.nombre_usuario USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(u.nombre_completo USING utf8mb4) COLLATE utf8mb4_general_ci
-                )
-            SET r.user_id = u.id
-            WHERE r.user_id IS NULL
+            UPDATE reservas
+            SET user_id = (
+                SELECT u.id FROM usuarios u
+                WHERE reservas.nombre_usuario = u.username COLLATE NOCASE
+                   OR reservas.nombre_usuario = u.nombre_completo COLLATE NOCASE
+                LIMIT 1
+            )
+            WHERE user_id IS NULL AND EXISTS (
+                SELECT 1 FROM usuarios u
+                WHERE reservas.nombre_usuario = u.username COLLATE NOCASE
+                   OR reservas.nombre_usuario = u.nombre_completo COLLATE NOCASE
+            )
         ''')
         conn.commit()
     finally:
@@ -210,7 +199,7 @@ def verificar_premium(user_id):
         cursor.execute("SELECT COUNT(*) FROM premium WHERE user_id = %s", (user_id,))
         resultado = cursor.fetchone()
         return resultado and resultado[0] > 0
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error verificando premium: {err}")
         return False
     finally:
@@ -250,13 +239,9 @@ def contiene_lenguaje_ofensivo(texto):
 def asegurar_columna_propietario_producto(conn):
     cursor = conn.cursor()
     try:
-        cursor.execute('''
-            SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'productos'
-              AND COLUMN_NAME = 'owner_user_id'
-        ''')
-        if not cursor.fetchone()[0]:
-            cursor.execute('ALTER TABLE productos ADD COLUMN owner_user_id INT NULL AFTER id')
+        cursor.execute('PRAGMA table_info(productos)')
+        if not any(row[1] == 'owner_user_id' for row in cursor.fetchall()):
+            cursor.execute('ALTER TABLE productos ADD COLUMN owner_user_id INT NULL')
             conn.commit()
     finally:
         cursor.close()
@@ -267,15 +252,15 @@ def asegurar_tabla_valoraciones_producto(conn):
     try:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS producto_valoraciones (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 producto_id INT NOT NULL,
                 usuario_id INT NOT NULL,
                 calificacion TINYINT NOT NULL,
-                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY valoracion_producto_usuario (producto_id, usuario_id),
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (producto_id, usuario_id),
                 FOREIGN KEY (producto_id) REFERENCES productos(id) ON DELETE CASCADE,
                 FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            )
         ''')
         conn.commit()
     finally:
@@ -307,7 +292,7 @@ def usuario_baneado(usuario_id):
         cursor.execute("SELECT baneado, motivo_baneo FROM usuarios WHERE id = %s", (usuario_id,))
         usuario = cursor.fetchone() or {}
         return bool(usuario.get('baneado')), usuario.get('motivo_baneo')
-    except mysql.connector.Error:
+    except sqlite3.Error:
         return False, None
     finally:
         if cursor:
@@ -330,7 +315,7 @@ def banear_usuario_por_moderacion(usuario_id, motivo, evidencia, locacion_id):
         """, (motivo, evidencia, locacion_id, usuario_id))
         conn.commit()
         return True
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error aplicando baneo automatico: {err}")
         return False
@@ -364,7 +349,7 @@ def contar_notificaciones(user_id):
         """, (user_id, user_id, user_id))
         resultado = cursor.fetchone()
         return resultado[0] if resultado else 0
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error contando notificaciones: {err}")
         return 0
     finally:
@@ -461,7 +446,7 @@ def mostrar_seccion_informativa(seccion):
                 'WHERE activo = TRUE ORDER BY orden, id'
             )
             bloques = cursor.fetchall()
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             print(f'Error cargando contenido de {seccion}: {err}')
         finally:
             if cursor:
@@ -528,7 +513,7 @@ def informacion_torneos():
                 ORDER BY orden, id
             ''')
             torneos = cursor.fetchall()
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             # La página sigue disponible aunque todavía no se haya aplicado la migración.
             print(f'Error cargando torneos: {err}')
         finally:
@@ -601,7 +586,7 @@ def registro():
             conn.commit()
             flash('Registro exitoso! Por favor inicia sesion.', 'success')
             return redirect(url_for('login'))
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             conn.rollback()
             print(f"Error al registrar: {err}")
             flash('No fue posible registrar el usuario. El correo o usuario ya existen.', 'error')
@@ -631,7 +616,7 @@ def login():
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT * FROM usuarios WHERE email = %s", (email,))
             usuario = cursor.fetchone()
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             print(f"Error: {err}")
             flash("Error al consultar la base de datos.", "error")
             return redirect(url_for("login"))
@@ -710,7 +695,7 @@ def productos():
         asegurar_columna_propietario_producto(conn)
         cursor.execute(query, tuple(params))
         lista_productos = cursor.fetchall()
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error al filtrar productos: {err}")
         lista_productos = []
     finally:
@@ -769,7 +754,7 @@ def tienda_productos():
             cursor.execute('SELECT id FROM categorias ORDER BY id LIMIT 1')
             categoria = cursor.fetchone()
             if not categoria:
-                raise mysql.connector.Error(msg='No hay categorías disponibles')
+                raise sqlite3.Error('No hay categorías disponibles')
             cursor.execute('''
                 INSERT INTO productos
                     (owner_user_id, nombre, slug, descripcion_corta, descripcion_larga,
@@ -779,7 +764,7 @@ def tienda_productos():
                   categoria['id'], precio, f'uploads/productos/{nombre_archivo}'))
             conn.commit()
             flash('Producto publicado correctamente.', 'success')
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             conn.rollback()
             if os.path.exists(ruta_imagen):
                 os.remove(ruta_imagen)
@@ -871,7 +856,7 @@ def producto_detalle(slug):
         valoracion = cursor.fetchone() or {'promedio': 0, 'total': 0}
         cursor.execute("SELECT * FROM productos WHERE id != %s LIMIT 4", (producto['id'],))
         similares = cursor.fetchall()
-    except mysql.connector.Error:
+    except sqlite3.Error:
         similares = []
 
     try:
@@ -887,7 +872,7 @@ def producto_detalle(slug):
             ORDER BY valoracion_promedio DESC, total_valoraciones DESC, pf.created_at DESC
         """, (producto['id'],))
         preguntas = cursor.fetchall()
-    except mysql.connector.Error:
+    except sqlite3.Error:
         preguntas = []
 
     cursor.close()
@@ -924,7 +909,7 @@ def preguntar_producto(slug):
         ''', (producto['id'], session['user_id'], pregunta))
         conn.commit()
         flash('Pregunta enviada. Aparecerá cuando sea aprobada.', 'success')
-    except mysql.connector.Error:
+    except sqlite3.Error:
         conn.rollback()
         flash('No fue posible guardar la pregunta.', 'error')
     finally:
@@ -953,14 +938,15 @@ def calificar_pregunta_producto(pregunta_id):
         cursor.execute('''
             INSERT INTO preguntas_frecuentes_valoraciones (pregunta_id, usuario_id, calificacion)
             SELECT id, %s, %s FROM preguntas_frecuentes WHERE id = %s AND aprobada = 1
-            ON DUPLICATE KEY UPDATE calificacion = VALUES(calificacion), fecha = CURRENT_TIMESTAMP
+            ON CONFLICT (pregunta_id, usuario_id) DO UPDATE
+            SET calificacion = excluded.calificacion, fecha = CURRENT_TIMESTAMP
         ''', (session['user_id'], calificacion, pregunta_id))
         if cursor.rowcount == 0:
             flash('La pregunta no está disponible para calificar.', 'error')
         else:
             conn.commit()
             flash('Tu calificación de la pregunta fue guardada.', 'success')
-    except mysql.connector.Error:
+    except sqlite3.Error:
         conn.rollback()
         flash('No fue posible guardar la calificación.', 'error')
     finally:
@@ -994,11 +980,12 @@ def calificar_producto(slug):
         cursor.execute('''
             INSERT INTO producto_valoraciones (producto_id, usuario_id, calificacion)
             VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE calificacion = VALUES(calificacion), fecha = CURRENT_TIMESTAMP
+            ON CONFLICT (producto_id, usuario_id) DO UPDATE
+            SET calificacion = excluded.calificacion, fecha = CURRENT_TIMESTAMP
         ''', (producto['id'], session['user_id'], calificacion))
         conn.commit()
         flash('Tu calificación fue guardada.', 'success')
-    except mysql.connector.Error:
+    except sqlite3.Error:
         conn.rollback()
         flash('No fue posible guardar la calificación.', 'error')
     finally:
@@ -1046,7 +1033,7 @@ def catalogo():
         cursor = conn.cursor(dictionary=True)
         cursor.execute(query, tuple(parametros))
         productos_lista = cursor.fetchall()
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error en catalogo: {err}")
         productos_lista = []
     finally:
@@ -1080,7 +1067,7 @@ def contacto():
             conn.commit()
             flash('Mensaje enviado con exito!', 'success')
             return redirect(url_for('contacto_exito'))
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             print(f"Error: {err}")
             flash('Hubo un error interno.', 'error')
             return redirect(url_for('contacto'))
@@ -1096,7 +1083,7 @@ def contacto():
                 cursor = conn.cursor(dictionary=True)
                 cursor.execute("SELECT username, email FROM usuarios WHERE id = %s", (session['user_id'],))
                 usuario_datos = cursor.fetchone()
-            except mysql.connector.Error as err:
+            except sqlite3.Error as err:
                 print(f"Error: {err}")
             finally:
                 cursor.close()
@@ -1133,12 +1120,13 @@ def agregar_al_carrito(producto_id):
         query = """
             INSERT INTO carrito (usuario_id, producto_id, cantidad) 
             VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE cantidad = cantidad + VALUES(cantidad)
+            ON CONFLICT (usuario_id, producto_id) DO UPDATE
+            SET cantidad = carrito.cantidad + excluded.cantidad
         """
         cursor.execute(query, (usuario_id, producto_id, cantidad))
         conn.commit()
         flash("Producto agregado al carrito", "success")
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error al agregar al carrito: {err}")
         flash("No se pudo agregar el producto", "error")
@@ -1217,7 +1205,7 @@ def crear_compra():
     except ValueError as err:
         conn.rollback()
         return jsonify(error=str(err)), 400
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error al crear compra: {err}")
         return jsonify(error='No fue posible registrar la compra.'), 500
@@ -1250,7 +1238,7 @@ def ver_carrito():
         cursor.execute(query, (usuario_id,))
         carrito_items = cursor.fetchall()
         total = sum(item['subtotal'] for item in carrito_items)
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error al cargar carrito: {err}")
     finally:
         cursor.close()
@@ -1273,7 +1261,7 @@ def eliminar_item_carrito(carrito_id):
         cursor.execute("DELETE FROM carrito WHERE id = %s AND usuario_id = %s", (carrito_id, usuario_id))
         conn.commit()
         flash("Producto eliminado del carrito", "success")
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error al eliminar item: {err}")
     finally:
@@ -1304,7 +1292,7 @@ def premium():
             conn.commit()
             flash('Suscripcion Premium activada!', 'success')
             return redirect(url_for('index'))
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             print(f"Error en Premium: {err}")
             flash('Error al procesar la suscripcion.', 'error')
             return redirect(url_for('premium'))
@@ -1345,7 +1333,7 @@ def notificaciones():
         """
         cursor.execute(query, (usuario_id, usuario_id, usuario_id))
         notificaciones_list = cursor.fetchall()
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error al cargar notificaciones: {err}")
         notificaciones_list = []
     finally:
@@ -1388,7 +1376,7 @@ def soporte_tecnico():
             conn.commit()
             flash('Solicitud de soporte enviada con exito!', 'success')
             return redirect(url_for('contacto_exito'))
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             conn.rollback()
             print(f"Error al guardar soporte: {err}")
             flash('Hubo un error al procesar tu solicitud.', 'error')
@@ -1490,7 +1478,7 @@ def editarperfil():
             flash("Perfil actualizado con éxito!", "success")
             return redirect(url_for("editarperfil"))
 
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             conn.rollback()
             print(f"Error al actualizar el perfil: {err}")
             flash("Error al actualizar los datos.", "error")
@@ -1511,7 +1499,7 @@ def editarperfil():
             WHERE u.id = %s
         """, (session['user_id'],))
         usuario = cursor.fetchone()
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(err)
         flash("No fue posible obtener el usuario.", "error")
         return redirect(url_for("index"))
@@ -1576,7 +1564,7 @@ def entreno():
     ve_contenido_premium = (rol_usuario == 'admin' or tiene_premium_db)
     tipo_cuenta = 'admin' if rol_usuario == 'admin' else ('premium' if tiene_premium_db else 'free')
 
-    conn = mysql.connector.connect(**db_config)
+    conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
 
     if ve_contenido_premium:
@@ -1656,8 +1644,8 @@ def disponibilidad_reservas():
         cursor.execute('''
                  SELECT locacion_id,
                      MIN(id) AS id,
-                     TIME_FORMAT(hora_reserva, CONCAT(CHAR(37), 'H:', CHAR(37), 'i')) AS hora_reserva,
-                     TIME_FORMAT(COALESCE(hora_fin, ADDTIME(hora_reserva, '01:00:00')), CONCAT(CHAR(37), 'H:', CHAR(37), 'i')) AS hora_fin
+                     strftime('%H:%M', hora_reserva) AS hora_reserva,
+                     strftime('%H:%M', COALESCE(hora_fin, time(hora_reserva, '+1 hour'))) AS hora_fin
             FROM reservas WHERE fecha_reserva = %s
             GROUP BY locacion_id, fecha_reserva, hora_reserva, hora_fin
         ''', (fecha,))
@@ -1730,7 +1718,7 @@ def crear_reserva_api():
         cursor.execute('''
             SELECT id FROM reservas
             WHERE locacion_id = %s AND fecha_reserva = %s
-              AND hora_reserva < %s AND COALESCE(hora_fin, ADDTIME(hora_reserva, '01:00:00')) > %s
+              AND hora_reserva < %s AND COALESCE(hora_fin, time(hora_reserva, '+1 hour')) > %s
         ''', (locacion_id, fecha, hora_fin, hora))
         if cursor.fetchone():
             return jsonify({'error': 'Ese horario ya está reservado.'}), 409
@@ -1738,7 +1726,7 @@ def crear_reserva_api():
         cursor.execute('INSERT INTO reservas (locacion_id, user_id, nombre_usuario, fecha_reserva, hora_reserva, hora_fin) VALUES (%s, %s, %s, %s, %s, %s)', (locacion_id, session['user_id'], nombre_usuario or 'Usuario', fecha, hora, hora_fin))
         conn.commit()
         return jsonify({'status': 'success', 'reserva_id': cursor.lastrowid})
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error guardando reserva: {err}')
         return jsonify({'error': 'No se pudo guardar la reserva. Verifica que la tabla reservas tenga la columna hora_fin.'}), 500
@@ -1763,7 +1751,7 @@ def eliminar_reserva(reserva_id):
             return jsonify({'error': 'La reserva no existe o no pertenece a tu cuenta.'}), 404
         conn.commit()
         return jsonify({'status': 'success'})
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error eliminando reserva: {err}')
         return jsonify({'error': 'No se pudo eliminar la reserva.'}), 500
@@ -1846,7 +1834,7 @@ def admin_torneos():
         cursor.execute('SELECT id, nombre, categoria, fecha, lugar, nivel, descripcion FROM torneos ORDER BY orden, id')
         torneos = cursor.fetchall()
         return render_template('admin/torneos.html', contenidos=contenidos, torneos=torneos)
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error administrando torneos: {err}')
         flash('No fue posible guardar los cambios. Verifica que ejecutaste informacion_extra.sql.', 'error')
@@ -1890,7 +1878,7 @@ def admin_denuncias():
             ORDER BY d.fecha_denuncia DESC
         ''')
         return render_template('admin/denuncias.html', denuncias=cursor.fetchall())
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error cargando denuncias: {err}')
         flash('No fue posible cargar las denuncias.', 'error')
@@ -2077,7 +2065,7 @@ def admin_crud(resource):
             cursor.execute(f"SELECT * FROM {config['table']} WHERE id = %s", (edit_id,))
             record = cursor.fetchone()
         return render_template('admin/crud.html', config=config, records=records, record=record, search=search, resource=resource)
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error CRUD {resource}: {err}')
         flash('No se pudo completar la operación. Revisa las relaciones del registro.', 'error')
@@ -2102,7 +2090,7 @@ def admin_crud_eliminar(resource, record_id):
         cursor.execute(f"DELETE FROM {config['table']} WHERE id = %s", (record_id,))
         conn.commit()
         flash('Registro eliminado correctamente.', 'success')
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error eliminando {resource}: {err}')
         flash('No se puede eliminar este registro porque está relacionado con otros datos.', 'error')
@@ -2143,7 +2131,7 @@ def apelar_baneo():
             conn.commit()
             flash('Tu apelación fue enviada para revisión administrativa.', 'success')
             return redirect(url_for('apelar_baneo'))
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             conn.rollback()
             print(f"Error guardando apelación: {err}")
             flash('No fue posible enviar la apelación.', 'error')
@@ -2202,7 +2190,7 @@ def admin_apelaciones():
         """)
         apelaciones = cursor.fetchall()
         return render_template('admin/apelaciones.html', apelaciones=apelaciones)
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error cargando apelaciones: {err}')
         flash('No fue posible cargar las apelaciones.', 'error')
@@ -2254,10 +2242,10 @@ def admin_perfiles():
         usuarios = cursor.fetchall()
         return render_template('admin/perfiles.html', usuarios=usuarios)
 
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         if conn:
             conn.rollback()
-        print(f"Error MySQL: {err}")
+        print(f"Error SQLite: {err}")
         flash("Error al cargar los perfiles.", "error")
         return redirect(url_for('index'))
     finally:
@@ -2333,15 +2321,15 @@ def admin_actualizar_usuario(id):
                     INSERT INTO perfil_usuario 
                         (usuario_id, apellido, foto, fecha_nacimiento, nivel, mano, reves, club, biografia)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        apellido = VALUES(apellido),
-                        foto = VALUES(foto),
-                        fecha_nacimiento = VALUES(fecha_nacimiento),
-                        nivel = VALUES(nivel),
-                        mano = VALUES(mano),
-                        reves = VALUES(reves),
-                        club = VALUES(club),
-                        biografia = VALUES(biografia)
+                    ON CONFLICT (usuario_id) DO UPDATE SET
+                        apellido = excluded.apellido,
+                        foto = excluded.foto,
+                        fecha_nacimiento = excluded.fecha_nacimiento,
+                        nivel = excluded.nivel,
+                        mano = excluded.mano,
+                        reves = excluded.reves,
+                        club = excluded.club,
+                        biografia = excluded.biografia
                 """, (id, apellido, foto_nombre, fecha_nacimiento, nivel, mano, reves, club, biografia))
             else:
                 # Si no subió foto, mantenemos la foto actual en la base de datos
@@ -2349,14 +2337,14 @@ def admin_actualizar_usuario(id):
                     INSERT INTO perfil_usuario 
                         (usuario_id, apellido, fecha_nacimiento, nivel, mano, reves, club, biografia)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        apellido = VALUES(apellido),
-                        fecha_nacimiento = VALUES(fecha_nacimiento),
-                        nivel = VALUES(nivel),
-                        mano = VALUES(mano),
-                        reves = VALUES(reves),
-                        club = VALUES(club),
-                        biografia = VALUES(biografia)
+                    ON CONFLICT (usuario_id) DO UPDATE SET
+                        apellido = excluded.apellido,
+                        fecha_nacimiento = excluded.fecha_nacimiento,
+                        nivel = excluded.nivel,
+                        mano = excluded.mano,
+                        reves = excluded.reves,
+                        club = excluded.club,
+                        biografia = excluded.biografia
                 """, (id, apellido, fecha_nacimiento, nivel, mano, reves, club, biografia))
 
             conn.commit()
@@ -2380,10 +2368,10 @@ def admin_actualizar_usuario(id):
 
         return render_template('admin/actualizar_eliminar_perfil.html', usuario=usuario)
 
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         if conn:
             conn.rollback()
-        print(f"Error MySQL: {err}")
+        print(f"Error SQLite: {err}")
         flash("Error al actualizar datos del perfil.", "error")
         return redirect(url_for('admin_perfiles'))
     finally:
@@ -2408,7 +2396,7 @@ def facturas():
         query = """
             SELECT
                 f.id,
-                CONCAT('FAC-', LPAD(f.id, 4, '0')) AS id_formateado,
+                printf('FAC-%04d', f.id) AS id_formateado,
                 f.fecha,
                 f.total,
                 f.estado,
@@ -2423,7 +2411,7 @@ def facturas():
 
         if busqueda:
             query += """ WHERE f.id LIKE %s 
-                        OR CONCAT('FAC-', LPAD(f.id, 4, '0')) LIKE %s 
+                        OR printf('FAC-%04d', f.id) LIKE %s
                         OR u.username LIKE %s 
                         OR u.email LIKE %s 
                         OR f.estado LIKE %s"""
@@ -2456,7 +2444,7 @@ def facturas():
             fac['num_productos'] = sum(p['cantidad'] for p in productos)
             facturas.append(fac)
 
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error al cargar facturas: {err}")
         flash("Error al cargar las facturas.", "error")
         facturas = []
@@ -2485,7 +2473,7 @@ def editar_factura(id):
                 cursor.execute("DELETE FROM facturas WHERE id = %s", (id,))
                 conn.commit()
                 flash("Factura eliminada correctamente.", "success")
-            except mysql.connector.Error as err:
+            except sqlite3.Error as err:
                 conn.rollback()
                 flash("Error al eliminar la factura.", "error")
             finally:
@@ -2535,7 +2523,7 @@ def editar_factura(id):
             flash("Factura y datos de entrega actualizados con éxito.", "success")
             return redirect(url_for('facturas'))
 
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             conn.rollback()
             print(f"Error al actualizar factura: {err}")
             flash("Error al actualizar la factura.", "error")
@@ -2545,7 +2533,7 @@ def editar_factura(id):
 
     # GET: Cargar datos actuales de la factura
     cursor.execute("""
-        SELECT f.*, CONCAT('FAC-', LPAD(f.id, 4, '0')) AS id_formateado, u.username, u.email
+        SELECT f.*, printf('FAC-%04d', f.id) AS id_formateado, u.username, u.email
         FROM facturas f
         JOIN usuarios u ON f.usuario_id = u.id
         WHERE f.id = %s
@@ -2597,7 +2585,7 @@ def mis_compras():
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT f.id, CONCAT('FAC-', LPAD(f.id, 4, '0')) AS id_formateado,
+            SELECT f.id, printf('FAC-%04d', f.id) AS id_formateado,
                    f.fecha, f.total, f.estado, f.metodo_pago, u.username AS cliente
             FROM facturas f
             JOIN usuarios u ON u.id = f.usuario_id
@@ -2617,7 +2605,7 @@ def mis_compras():
             factura['productos'] = cursor.fetchall()
             factura['fecha_iso'] = factura['fecha'].isoformat() if factura['fecha'] else ''
             factura['fecha_entrega_estimada'] = (factura['fecha'] + timedelta(days=5)).date().isoformat() if factura['fecha'] else ''
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error al cargar compras: {err}")
         flash("No fue posible cargar tus compras.", "error")
     finally:
@@ -2815,7 +2803,7 @@ def detalle_pedido(id):
         """, (id,))
         pago = cursor.fetchone()
 
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error al cargar detalle de orden: {err}")
         flash("Error al cargar los detalles de la orden.", "error")
         return redirect(url_for('admin_pedidos_envios'))
@@ -2878,7 +2866,7 @@ def admin_inventario():
         cursor.execute(query, params)
         productos = cursor.fetchall()
 
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error al cargar inventario: {err}")
         flash("Error al cargar el inventario.", "error")
         productos = []
@@ -2913,7 +2901,7 @@ def editar_inventario(id):
                 cursor.execute("DELETE FROM productos WHERE id = %s", (id,))
                 conn.commit()
                 flash("Producto eliminado del inventario.", "success")
-            except mysql.connector.Error:
+            except sqlite3.Error:
                 conn.rollback()
                 flash("No se puede eliminar el producto porque tiene facturas o ventas asociadas.", "error")
             finally:
@@ -2952,7 +2940,7 @@ def editar_inventario(id):
             conn.commit()
             return redirect(url_for('admin_inventario'))
 
-        except mysql.connector.Error as err:
+        except sqlite3.Error as err:
             conn.rollback()
             print(f"Error en BD: {err}")
             flash(f"Error en la operación: {err.msg}", "error")
@@ -2987,7 +2975,7 @@ def admin_contacto():
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT * FROM solicitudes_contacto WHERE respuesta IS NULL ORDER BY fecha_envio DESC")
         mensajes = cursor.fetchall()
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error cargando mensajes: {err}")
         mensajes = []
     finally:
@@ -3019,7 +3007,7 @@ def responder_contacto(msg_id):
         cursor.execute(query, (respuesta, msg_id))
         conn.commit()
         flash('Respuesta enviada con exito!', 'success')
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error al responder contacto: {err}")
         flash('Hubo un error al enviar la respuesta.', 'error')
@@ -3048,7 +3036,7 @@ def admin_soporte():
         """
         cursor.execute(query)
         tickets = cursor.fetchall()
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         print(f"Error cargando soporte: {err}")
         tickets = []
     finally:
@@ -3078,7 +3066,7 @@ def responder_soporte(ticket_id):
         """, (respuesta, ticket_id))
         conn.commit()
         flash('Respuesta enviada correctamente.', 'success')
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error al responder soporte: {err}")
         flash('Hubo un error al enviar la respuesta.', 'error')
@@ -3105,7 +3093,7 @@ def eliminar_mensaje(origen, id_msg):
         cursor.execute(f"DELETE FROM {tabla} WHERE id = %s", (id_msg,))
         conn.commit()
         flash("Registro eliminado correctamente.", "success")
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error al eliminar registro: {err}")
         flash("No se pudo eliminar el registro.", "error")
@@ -3140,7 +3128,7 @@ def eliminar_notificacion(origen, id_notif):
         cursor.execute(f"DELETE FROM {tabla} WHERE id = %s AND usuario_id = %s", (id_notif, usuario_id))
         conn.commit()
         flash("Notificacion eliminada correctamente.", "success")
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f"Error al eliminar notificacion: {err}")
         flash("No se pudo eliminar la notificacion.", "error")
@@ -3163,7 +3151,7 @@ def recuperar_password():
         email = request.form.get('email')
         
         try:
-            conn = mysql.connector.connect(**db_config)
+            conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT * FROM usuarios WHERE email = %s", (email,))
             usuario = cursor.fetchone()
@@ -3261,7 +3249,7 @@ def reset_password(token):
         password_hashed = generate_password_hash(nueva_password)
 
         try:
-            conn = mysql.connector.connect(**db_config)
+            conn = get_db_connection()
             cursor = conn.cursor()
             
             query = "UPDATE usuarios SET password = %s WHERE email = %s"
@@ -3304,11 +3292,12 @@ def calificar_comentario_mapa(comentario_id):
         cursor.execute("""
             INSERT INTO comentarios_valoraciones (comentario_id, usuario_id, calificacion)
             VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE calificacion = VALUES(calificacion), fecha = CURRENT_TIMESTAMP
+            ON CONFLICT (comentario_id, usuario_id) DO UPDATE
+            SET calificacion = excluded.calificacion, fecha = CURRENT_TIMESTAMP
         """, (comentario_id, session['user_id'], calificacion))
         conn.commit()
         flash('Valoración guardada.', 'success')
-    except mysql.connector.Error:
+    except sqlite3.Error:
         conn.rollback()
         flash('No fue posible guardar la valoración.', 'error')
     finally:
@@ -3386,7 +3375,7 @@ def mapas():
                     SELECT * FROM reservas
                     WHERE locacion_id = %s AND fecha_reserva = %s
                       AND hora_reserva < %s
-                      AND COALESCE(hora_fin, ADDTIME(hora_reserva, '01:00:00')) > %s
+                      AND COALESCE(hora_fin, time(hora_reserva, '+1 hour')) > %s
                     """, (loc_id, fecha, hora_fin, hora))
                     existe = cur.fetchone()
                 
@@ -3848,7 +3837,7 @@ def enviar_mensaje():
         ''', (session['user_id'], receptor_id, texto, tipo, datos_extra, 'pendiente' if tipo == 'propuesta' else None))
         conn.commit()
         return jsonify({'status': 'success', 'mensaje_id': cursor.lastrowid})
-    except mysql.connector.Error as err:
+    except sqlite3.Error as err:
         conn.rollback()
         print(f'Error enviando mensaje: {err}')
         return jsonify({'error': 'No se pudo guardar el mensaje. Revisa la tabla messages en la base de datos.'}), 500
@@ -3880,7 +3869,7 @@ def denunciar_mensaje():
         ''', (mensaje_id, session['user_id'], mensaje['emisor_id'], motivo))
         conn.commit()
         return jsonify({'status': 'success'})
-    except mysql.connector.Error:
+    except sqlite3.Error:
         conn.rollback()
         return jsonify({'error': 'La denuncia no pudo guardarse.'}), 500
     finally:
@@ -3927,7 +3916,7 @@ def responder_propuesta():
                                 SELECT id FROM reservas
                                 WHERE locacion_id = %s AND fecha_reserva = %s
                                     AND hora_reserva < %s
-                                    AND COALESCE(hora_fin, ADDTIME(hora_reserva, '01:00:00')) > %s
+                                    AND COALESCE(hora_fin, time(hora_reserva, '+1 hour')) > %s
                         ''', (locacion_id, fecha, hora_fin, hora))
             if cursor.fetchone():
                 return jsonify({'error': 'La cancha ya esta reservada en ese horario.'}), 409

@@ -5,5 +5,4 @@ Authlib
 requests
 folium
 geopy
-mysql-connector-python
 itsdangerous
