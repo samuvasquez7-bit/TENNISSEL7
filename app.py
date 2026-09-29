@@ -1,7 +1,7 @@
 import os
 import sqlite3
+import threading
 from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify, Response, send_from_directory
-from database import connect as connect_sqlite
 from flask_session import Session
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
@@ -47,6 +47,49 @@ serializer = URLSafeTimedSerializer(app.secret_key)
 
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'db', 'tennissel20.sqlite3')
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'db', 'tennissel2.0.sql')
+
+
+class SQLiteCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        sql = sql.replace('%s', '?')
+        sql = re.sub(r'\bNOW\(\)', 'CURRENT_TIMESTAMP', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURDATE\(\)', "DATE('now', 'localtime')", sql, flags=re.IGNORECASE)
+        return super().execute(sql, parameters)
+
+
+class SQLiteConnection(sqlite3.Connection):
+    def cursor(self, factory=None, *, dictionary=False):
+        cursor = super().cursor(factory or SQLiteCursor)
+        if dictionary:
+            cursor.row_factory = sqlite3.Row
+        return cursor
+
+
+_database_initialization_lock = threading.Lock()
+
+
+def connect_sqlite(database_path, schema_path):
+    os.makedirs(os.path.dirname(database_path), exist_ok=True)
+    connection = sqlite3.connect(
+        database_path,
+        timeout=10,
+        factory=SQLiteConnection,
+    )
+    connection.execute('PRAGMA foreign_keys = ON')
+
+    try:
+        with _database_initialization_lock:
+            has_tables = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+            ).fetchone()
+            if not has_tables:
+                with open(schema_path, encoding='utf-8') as schema_file:
+                    connection.executescript(schema_file.read())
+        return connection
+    except Exception:
+        connection.close()
+        raise
 
 UPLOAD_FOLDER = os.path.join('static', 'uploads', 'perfiles')
 PRODUCT_UPLOAD_FOLDER = os.path.join('static', 'uploads', 'productos')
