@@ -1,0 +1,9 @@
+Flask
+Flask-Mail
+Flask-Session
+Authlib
+requests
+folium
+geopy
+mysql-connector-python
+itsdangerous
